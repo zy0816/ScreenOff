@@ -149,13 +149,25 @@ So the condition to check is not "built-in is off and there's no external displa
 
 Worse, the private API itself becomes unreliable in that state: calling
 `CGSConfigureDisplayEnabled` on the remembered built-in ID **does nothing at all**. The only
-thing that brings it back is enabling a whole range of IDs inside a single transaction. Hence a
+thing that brings it back is enabling a batch of IDs inside a single transaction. Hence a
 three-stage fallback:
 
 1. Built-in display still enumerable — normal path
 2. Enable the remembered ID directly (so the ID must be persisted *before* turning it off)
-3. Batch-enable every ID in one transaction — the only approach verified to work with no
-   physical display attached
+3. Batch-enable in one transaction — the only approach verified to work with no physical
+   display attached
+
+Two things about stage 3 that are easy to get wrong:
+
+**The IDs must come from a real record, never from guessing a range.** `CGDirectDisplayID` is
+opaque. On some Macs it is `1`, `2`, `3`; on others it is `69733248`. Iterating `0..<40` works
+on the former and silently never touches the built-in display on the latter. So every ID the
+app has seen is persisted while enumeration still works, and recovery uses that set.
+
+**`CGSCompleteDisplayConfiguration` lies.** It routinely returns `kCGErrorIllegalArgument`
+(1001) *while the display does come back on*. Treating that return code as failure produces
+a bogus error dialog and aborts a recovery that actually worked — so the real display state is
+polled instead, and only a genuinely unchanged state counts as a failure.
 
 ### Black-screen protection
 

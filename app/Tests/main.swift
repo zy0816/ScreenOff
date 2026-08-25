@@ -50,6 +50,26 @@ guard let builtin = c.builtin else {
 print("== 保护逻辑")
 check("canTurnOff 与外接屏状态一致", c.canTurnOff == !c.externalsLit.isEmpty)
 
+print("== 虚拟屏识别")
+check("当前没有屏被误判成虚拟屏", DisplayController().displays.allSatisfy { !$0.isVirtual })
+check("真实在亮的屏都不是虚拟屏", DisplayController().displays.filter(\.isLit).allSatisfy { !$0.isVirtual })
+check("有真屏亮着时 isStranded 为假", !DisplayController().isStranded)
+
+print("== 记住 display ID")
+DisplayController().rememberDisplays()
+let remembered = DisplayController()
+check("内建屏 ID 已记住且一致",
+      remembered.rememberedBuiltinID == remembered.builtin?.id)
+// 这条防的是 1.0 的回归：恢复候选集不能靠猜 0..<40，
+// CGDirectDisplayID 在很多机器上是大数值。
+check("见过的真实 ID 都被记下来了",
+      Set(remembered.displays.filter { !$0.isVirtual }.map(\.id))
+        .isSubset(of: Set(remembered.rememberedIDs)))
+if let maxID = remembered.rememberedIDs.max() {
+    print("    记住的 ID: \(remembered.rememberedIDs.map(String.init).joined(separator: ", "))"
+          + (maxID >= 40 ? "   ← 超出旧版 0..<40 的猜测范围" : ""))
+}
+
 if dryRun {
     print("\n--dry：跳过真实开关。")
     exit(failures == 0 ? 0 : 1)
@@ -95,16 +115,6 @@ do {
 } catch {
     check("打开内建屏未抛错（\(error.localizedDescription)）", false)
 }
-
-print("== 虚拟屏识别")
-check("当前没有屏被误判成虚拟屏", DisplayController().displays.allSatisfy { !$0.isVirtual })
-check("真实在亮的屏都不是虚拟屏", DisplayController().displays.filter(\.isLit).allSatisfy { !$0.isVirtual })
-check("有真屏亮着时 isStranded 为假", !DisplayController().isStranded)
-
-print("== 记住内建屏 ID")
-DisplayController().rememberBuiltinID()
-check("ID 已记住且与当前内建屏一致",
-      DisplayController().rememberedBuiltinID == DisplayController().builtin?.id)
 
 print("== 主显示器切换")
 let ctl = DisplayController()

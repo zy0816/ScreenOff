@@ -14,7 +14,12 @@ displaytoggle — 在接了外置显示器时，开关 Mac 内建屏幕。
 要点：内建屏一旦被禁用，就从公开的 CGGetOnlineDisplayList 里消失了
 （CGDisplayIsOnline 变 0，连 CGDisplayCreateUUIDFromDisplayID 都返回 NULL），
 只有私有的 CGSGetDisplayList 还留着它的槽位，而 CGDisplayIsBuiltin 对
-已禁用的槽位依然有效 —— 这是能把屏幕开回来的关键，所以不必缓存 display ID。
+已禁用的槽位依然有效 —— 这是能把屏幕开回来的关键。
+
+注意这个结论只在「还有别的屏亮着」时成立：物理屏全部消失时，内建屏的槽位
+也会一起消失，系统还会插入一块虚拟屏（vendor/model = "unkn"/"virt"）冒充。
+菜单栏 App 为此持久化了 display ID 并做了三级恢复；命令行版是一次性命令，
+只保证不把虚拟屏误当成真屏。
 
 用法:
     displaytoggle.py                # 切换内建屏
@@ -69,9 +74,12 @@ _lib.CGSGetDisplayList.argtypes = [
 ]
 _lib.CGSGetDisplayList.restype = CGError
 
+# 必须显式声明签名：display ID 是不透明的 uint32，某些机器上大于 2^31，
+# 靠 ctypes 的默认 int 转换会被当成有符号数传错。
 for _name in ("CGDisplayIsBuiltin", "CGDisplayIsActive", "CGDisplayIsAsleep",
               "CGDisplayIsOnline", "CGDisplayIsMain", "CGDisplayPixelsWide",
-              "CGDisplayPixelsHigh", "CGDisplayUnitNumber"):
+              "CGDisplayPixelsHigh", "CGDisplayUnitNumber",
+              "CGDisplayVendorNumber", "CGDisplayModelNumber"):
     _fn = getattr(_lib, _name)
     _fn.argtypes = [CGDirectDisplayID]
     _fn.restype = ctypes.c_uint32  # boolean_t 也是 4 字节
@@ -118,6 +126,11 @@ def _err(code: int) -> str:
 
 
 class Display:
+    # 失去全部物理屏时，系统会造一块虚拟屏顶上，vendor/model 是 ASCII 魔数
+    # "unkn" / "virt"。它 active=1 但没有任何物理输出，当成真屏会让黑屏保护失效。
+    VIRTUAL_VENDOR = 0x756E6B6E  # "unkn"
+    VIRTUAL_MODEL = 0x76697274   # "virt"
+
     def __init__(self, did: int):
         self.id = did
         self.builtin = bool(_lib.CGDisplayIsBuiltin(did))
@@ -128,6 +141,15 @@ class Display:
         self.width = _lib.CGDisplayPixelsWide(did)
         self.height = _lib.CGDisplayPixelsHigh(did)
         self.unit = _lib.CGDisplayUnitNumber(did)
+        self.vendor = _lib.CGDisplayVendorNumber(did)
+        self.model = _lib.CGDisplayModelNumber(did)
+
+    @property
+    def is_virtual(self) -> bool:
+        """系统伪造的虚拟屏，不是真实物理输出。"""
+        return (not self.builtin
+                and self.vendor == self.VIRTUAL_VENDOR
+                and self.model == self.VIRTUAL_MODEL)
 
     @property
     def phantom(self) -> bool:
@@ -136,11 +158,13 @@ class Display:
 
     @property
     def lit(self) -> bool:
-        """真正在显示画面。"""
-        return self.active and not self.asleep
+        """真正在显示画面（虚拟屏没有物理输出，不算）。"""
+        return self.active and not self.asleep and not self.is_virtual
 
     @property
     def state(self) -> str:
+        if self.is_virtual:
+            return "virtual"
         if self.asleep:
             return "asleep"
         if self.active:
@@ -207,7 +231,9 @@ def set_enabled(display_id: int, enabled: bool,
         raise SystemExit(f"CGSConfigureDisplayEnabled 失败: {_err(rc)}")
 
     rc = _lib.CGSCompleteDisplayConfiguration(config, option)
-    if rc != 0:
+    # 提交的返回码不可信：拓扑异常时它经常返回 kCGErrorIllegalArgument(1001)，
+    # 而屏幕其实已经亮了。以真实状态为准，只有状态确实没变才当失败。
+    if rc != 0 and not _wait_for(display_id, enabled, timeout=2.0):
         raise SystemExit(f"CGSCompleteDisplayConfiguration 失败: {_err(rc)}")
 
 

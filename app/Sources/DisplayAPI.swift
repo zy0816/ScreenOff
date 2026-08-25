@@ -95,20 +95,41 @@ final class DisplayAPI {
         }
 
         rc = completeConfig(config, permanent ? kConfigurePermanently : kConfigureForSession)
-        guard rc == .success else { throw DisplayAPIError.callFailed("CGSCompleteDisplayConfiguration", rc) }
+        // 提交的返回码不可信：显示器拓扑异常时它经常返回 kCGErrorIllegalArgument(1001)，
+        // 而屏幕其实已经亮了。所以以真实状态为准，只有状态确实没变才当失败。
+        if rc != .success, !Self.waitForActive(id, enabled) {
+            throw DisplayAPIError.callFailed("CGSCompleteDisplayConfiguration", rc)
+        }
     }
 
-    /// 应急：一个事务里把一批 ID 全部点亮。
+    /// 轮询等某块屏的开关状态落定。显示配置是异步生效的。
+    static func waitForActive(_ id: CGDirectDisplayID, _ want: Bool,
+                              timeout: TimeInterval = 2.0) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if (CGDisplayIsActive(id) != 0) == want { return true }
+            usleep(150_000)
+        }
+        return (CGDisplayIsActive(id) != 0) == want
+    }
+
+    /// 应急：一个事务里把给定的一批 ID 全部点亮。
     ///
     /// 掉进「无物理屏」状态后，内建屏的槽位从 CGSGetDisplayList 里消失，
     /// 单独对记住的 ID 调 setEnabled 实测没有效果，只有这样批量提交才拉得回来。
+    ///
+    /// 注意 ID 必须由调用方给出真实值，不能靠猜范围：CGDirectDisplayID 是不透明的
+    /// uint32，某些机器上是 1、2、3 这样的小数字，另一些机器上是 69733248 这类大数，
+    /// 按 0..<40 遍历在后者上永远碰不到真正的内建屏。
+    ///
     /// 返回码不可靠（常见 kCGErrorIllegalArgument 但屏幕实际亮了），
     /// 所以这里不看返回值，由调用方轮询真实状态判断成败。
-    func forceEnableAll(upTo maxID: CGDirectDisplayID = 40) {
+    func forceEnable(_ ids: [CGDirectDisplayID]) {
         guard let beginConfig, let configureEnabled, let completeConfig else { return }
+        guard !ids.isEmpty else { return }
         var config: OpaquePointer?
         guard beginConfig(&config) == .success else { return }
-        for id in 0..<maxID {
+        for id in ids {
             _ = configureEnabled(config, id, true)
         }
         _ = completeConfig(config, kConfigureForSession)
@@ -185,6 +206,7 @@ struct DisplayInfo {
 final class DisplayController {
     private let api = DisplayAPI.shared
     private static let rememberedIDKey = "lastKnownBuiltinDisplayID"
+    private static let knownIDsKey = "knownDisplayIDs"
 
     var displays: [DisplayInfo] { api.displays() }
     var builtin: DisplayInfo? { displays.first(where: \.isBuiltin) }
@@ -208,9 +230,23 @@ final class DisplayController {
         set { UserDefaults.standard.set(Int(newValue ?? 0), forKey: Self.rememberedIDKey) }
     }
 
-    /// 趁内建屏还在枚举里，把它的 ID 记下来。
-    func rememberBuiltinID() {
+    /// 见过的所有 display ID。掉进无物理屏状态后枚举会变空，这份记录是唯一的线索。
+    private(set) var rememberedIDs: [CGDirectDisplayID] {
+        get {
+            (UserDefaults.standard.array(forKey: Self.knownIDsKey) as? [Int] ?? [])
+                .filter { $0 > 0 }.map(CGDirectDisplayID.init)
+        }
+        set {
+            UserDefaults.standard.set(newValue.map(Int.init), forKey: Self.knownIDsKey)
+        }
+    }
+
+    /// 趁枚举还正常，把内建屏 ID 和见过的所有 ID 都记下来。
+    func rememberDisplays() {
         if let builtin { rememberedBuiltinID = builtin.id }
+        let seen = displays.filter { !$0.isVirtual }.map(\.id)
+        guard !seen.isEmpty else { return }
+        rememberedIDs = Array(Set(rememberedIDs).union(seen)).sorted()
     }
 
     @discardableResult
@@ -257,21 +293,25 @@ final class DisplayController {
     func emergencyRestoreBuiltin() {
         if let builtin, !builtin.isActive {
             try? api.setEnabled(true, for: builtin.id, permanent: false)
-            if waitLit(builtin.id) { return }
+            if DisplayAPI.waitForActive(builtin.id, true) { return }
         }
         if let id = rememberedBuiltinID {
             try? api.setEnabled(true, for: id, permanent: false)
-            if waitLit(id) { return }
+            if DisplayAPI.waitForActive(id, true) { return }
         }
-        api.forceEnableAll()
+        api.forceEnable(recoveryCandidates())
     }
 
-    private func waitLit(_ id: CGDirectDisplayID, timeout: TimeInterval = 1.5) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if CGDisplayIsActive(id) != 0 { return true }
-            usleep(150_000)
-        }
-        return CGDisplayIsActive(id) != 0
+    /// 批量恢复要用的 ID 集合。
+    ///
+    /// 真实记录优先：见过的 ID + 记住的内建屏 ID + 当前还枚举得到的 ID。
+    /// 末尾补一段小范围仅仅是兜底（万一偏好被清空过），不能指望它——
+    /// CGDirectDisplayID 是不透明的 uint32，很多机器上根本不是小整数。
+    private func recoveryCandidates() -> [CGDirectDisplayID] {
+        var ids = Set(rememberedIDs)
+        if let id = rememberedBuiltinID { ids.insert(id) }
+        ids.formUnion(displays.map(\.id))
+        ids.formUnion((0..<40).map(CGDirectDisplayID.init))
+        return Array(ids).sorted()
     }
 }

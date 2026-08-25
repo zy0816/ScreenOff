@@ -5,7 +5,7 @@
 import AppKit
 import ServiceManagement
 
-let appVersion = "1.0"
+let appVersion = "1.1"
 
 // MARK: - 偏好设置
 
@@ -74,7 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.restoreIfStranded()
         }
 
-        controller.rememberBuiltinID()
+        controller.rememberDisplays()
         updateStatusIcon()
         restoreIfStranded()
 
@@ -151,16 +151,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
 
         let on = controller.isBuiltinOn
-        menu.addItem(sectionHeader("内建屏：\(on ? "开启" : "关闭")"))
+        let stranded = controller.isStranded
+        menu.addItem(sectionHeader(stranded ? "没有屏幕在显示画面"
+                                            : "内建屏：\(on ? "开启" : "关闭")"))
 
         let toggle = NSMenuItem(
-            title: on ? "关闭内建屏" : "打开内建屏",
+            title: stranded ? "恢复内建屏" : (on ? "关闭内建屏" : "打开内建屏"),
             action: #selector(toggleBuiltin), keyEquivalent: ""
         )
         toggle.target = self
         menu.addItem(toggle)
 
-        if on && !controller.canTurnOff {
+        if stranded {
+            menu.addItem(hintItem("系统当前只剩一块虚拟屏"))
+        } else if on && !controller.canTurnOff {
             toggle.isEnabled = false
             menu.addItem(hintItem("没有其它屏幕，关掉会黑屏"))
         } else if on, controller.builtin?.isMain == true,
@@ -224,13 +228,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: 动作
 
     @objc private func toggleBuiltin() {
+        // 掉进无物理屏状态时内建屏已经不在枚举里了，setBuiltin 会直接空转，
+        // 用户点了没反应。这种情况直接走应急恢复。
+        if controller.isStranded {
+            controller.emergencyRestoreBuiltin()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.updateStatusIcon()
+            }
+            return
+        }
+
         let on = controller.isBuiltinOn
         if on && !controller.canTurnOff {
             notify("没有其它屏幕", "关掉内建屏会直接黑屏。先接上外置显示器。")
             return
         }
         // 关屏前务必记住 ID：一旦外置屏随后也没了，这是唯一还能定位内建屏的线索。
-        controller.rememberBuiltinID()
+        controller.rememberDisplays()
         do {
             try controller.setBuiltin(!on, permanent: Prefs.permanent)
         } catch {
@@ -330,7 +344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard Prefs.autoRestore else { return }
         guard controller.isStranded else {
             // 一切正常时顺手刷新记住的 ID，好在出事时还有得用
-            controller.rememberBuiltinID()
+            controller.rememberDisplays()
             return
         }
         controller.emergencyRestoreBuiltin()
