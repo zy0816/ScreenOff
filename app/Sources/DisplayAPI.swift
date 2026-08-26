@@ -310,22 +310,26 @@ final class DisplayController {
     ///   2. 用记住的 ID 单独点亮
     ///   3. 批量点亮所有 ID（实测唯一在无物理屏状态下有效的办法）
     func emergencyRestoreBuiltin() {
-        // 0. 先让系统重新探测硬件。stranded 状态下 display ID 全部失效，
-        //    针对 ID 的事务一律被拒，得先让硬件重新被发现，后面几步才有意义。
-        if isStranded {
-            api.detectDisplays()
-            if let id = rememberedBuiltinID,
-               DisplayAPI.waitForActive(id, true, timeout: 4.0) { return }
+        // 恢复是个极窄的窗口：拔线之后 display ID 很快就会失效，赶上了 enable 就管用，
+        // 赶不上做什么都没用。所以第一步必须零延迟——先把 enable 发出去，
+        // 别在它前面放任何慢动作（探测硬件、等状态落定都算慢动作）。
+        //
+        // forceEnable 不看返回值也不等待，正合适：提交码本来就不可信，
+        // 成没成看后面轮询真实状态就行。
+        var quick = Set<CGDirectDisplayID>()
+        if let builtin, !builtin.isActive { quick.insert(builtin.id) }
+        if let id = rememberedBuiltinID { quick.insert(id) }
+        if !quick.isEmpty {
+            api.forceEnable(Array(quick))
+            if let id = rememberedBuiltinID ?? quick.first,
+               DisplayAPI.waitForActive(id, true, timeout: 1.0) { return }
         }
 
-        if let builtin, !builtin.isActive {
-            try? api.setEnabled(true, for: builtin.id, permanent: false)
-            if DisplayAPI.waitForActive(builtin.id, true) { return }
-        }
-        if let id = rememberedBuiltinID {
-            try? api.setEnabled(true, for: id, permanent: false)
-            if DisplayAPI.waitForActive(id, true) { return }
-        }
+        // 到这儿说明窗口已经错过了，才轮到这些慢办法碰运气。
+        api.detectDisplays()
+        if let id = rememberedBuiltinID,
+           DisplayAPI.waitForActive(id, true, timeout: 3.0) { return }
+
         api.forceEnable(recoveryCandidates())
     }
 

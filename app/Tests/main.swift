@@ -116,6 +116,15 @@ do {
     check("打开内建屏未抛错（\(error.localizedDescription)）", false)
 }
 
+// 这条防的是 1.2 的回归：当时把 detectDisplays + 4 秒等待放在了恢复链最前面，
+// 而恢复窗口只有一瞬，任何前置阻塞都等于放弃。第一个 enable 必须立刻发出去。
+print("== 紧急恢复的延迟")
+let t0 = Date()
+DisplayController().emergencyRestoreBuiltin()
+let elapsed = Date().timeIntervalSince(t0)
+check("紧急恢复没有前置阻塞（实测 \(String(format: "%.2f", elapsed))s，需 < 1.5s）",
+      elapsed < 1.5)
+
 print("== 主显示器切换")
 let ctl = DisplayController()
 if let originalMain = ctl.displays.first(where: \.isMain),

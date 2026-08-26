@@ -5,7 +5,7 @@
 import AppKit
 import ServiceManagement
 
-let appVersion = "1.2"
+let appVersion = "1.3"
 
 // MARK: - 偏好设置
 
@@ -88,7 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let controller = DisplayController()
     private let menu = NSMenu()
     /// 看护跑在自己的队列上，不依赖主 runloop —— 屏幕全没之后主线程未必还在转。
-    private let watchQueue = DispatchQueue(label: "displaytoggle.watchdog", qos: .userInitiated)
+    private let watchQueue = DispatchQueue(label: "displaytoggle.watchdog", qos: .userInteractive)
     private var watchTimer: DispatchSourceTimer?
     private var activityToken: NSObjectProtocol?
 
