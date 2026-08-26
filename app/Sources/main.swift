@@ -20,14 +20,62 @@ enum Prefs {
         get { d.bool(forKey: "permanent") }
         set { d.set(newValue, forKey: "permanent") }
     }
+    /// 排查用，默认关。开了才往 ~/Library/Logs/DisplayToggle.log 写东西。
+    static var diagnosticLog: Bool {
+        get { d.bool(forKey: "diagnosticLog") }
+        set { d.set(newValue, forKey: "diagnosticLog") }
+    }
+}
+
+// MARK: - 诊断日志
+
+enum Diag {
+    static let path = FileManager.default
+        .urls(for: .libraryDirectory, in: .userDomainMask).first?
+        .appendingPathComponent("Logs/DisplayToggle.log")
+
+    private static let queue = DispatchQueue(label: "displaytoggle.log")
+    private static let stamp: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
+    static func log(_ message: @autoclosure () -> String) {
+        guard Prefs.diagnosticLog, let path else { return }
+        let line = "[\(stamp.string(from: Date()))] \(message())\n"
+        queue.async {
+            guard let data = line.data(using: .utf8) else { return }
+            if let handle = try? FileHandle(forWritingTo: path) {
+                defer { try? handle.close() }
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            } else {
+                try? FileManager.default.createDirectory(
+                    at: path.deletingLastPathComponent(),
+                    withIntermediateDirectories: true)
+                try? data.write(to: path)
+            }
+        }
+    }
+
+    static func snapshot(_ tag: String, _ c: DisplayController) {
+        guard Prefs.diagnosticLog else { return }
+        let list = c.displays.map {
+            "\($0.id)\($0.isBuiltin ? "内建" : ($0.isVirtual ? "虚拟" : "外接"))"
+            + "=\($0.isActive ? "亮" : "灭")/online=\($0.isOnline ? 1 : 0)"
+        }.joined(separator: " | ")
+        log("\(tag): \(list.isEmpty ? "(空)" : list)  stranded=\(c.isStranded)")
+    }
 }
 
 // MARK: - App
 
 /// 显示器拓扑变化的 C 回调。比 NSApplication 的通知更靠得住：
 /// 掉进无物理屏状态时 AppKit 那条通知不一定还能指望。
-private let reconfigurationCallback: CGDisplayReconfigurationCallBack = { _, flags, userInfo in
+private let reconfigurationCallback: CGDisplayReconfigurationCallBack = { display, flags, userInfo in
     guard let userInfo else { return }
+    Diag.log("显示器回调 display=\(display) flags=0x\(String(flags.rawValue, radix: 16))")
     // 只关心屏幕被拿走的方向，加进来不会把人变成黑屏
     let interesting: CGDisplayChangeSummaryFlags = [.removeFlag, .disabledFlag, .setModeFlag]
     guard !flags.intersection(interesting).isEmpty else { return }
@@ -84,12 +132,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let timer = DispatchSource.makeTimerSource(queue: watchQueue)
         timer.schedule(deadline: .now() + 1.0, repeating: 1.0, leeway: .milliseconds(200))
         timer.setEventHandler { [weak self] in
+            self?.heartbeat()
             self?.restoreIfStranded()
         }
         timer.resume()
         watchTimer = timer
 
         controller.rememberDisplays()
+        Diag.log("=== App 启动 v\(appVersion) ===")
+        Diag.snapshot("启动时", controller)
         updateStatusIcon()
         restoreIfStranded()
 
@@ -224,6 +275,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         perm.state = Prefs.permanent ? .on : .off
         menu.addItem(perm)
 
+        let diag = NSMenuItem(title: "记录诊断日志", action: #selector(toggleDiagnostics), keyEquivalent: "")
+        diag.target = self
+        diag.state = Prefs.diagnosticLog ? .on : .off
+        menu.addItem(diag)
+
         let login = NSMenuItem(title: "开机启动", action: #selector(toggleLoginItem), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -287,6 +343,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Prefs.autoRestore.toggle()
     }
 
+    @objc private func toggleDiagnostics() {
+        Prefs.diagnosticLog.toggle()
+        if Prefs.diagnosticLog {
+            Diag.log("=== 开始记录 ===")
+            Diag.snapshot("当前", controller)
+            if let p = Diag.path {
+                notify("已开始记录诊断日志", "日志位置：\n\(p.path)\n\n复现问题后，把这个文件发出来。")
+            }
+        }
+    }
+
     @objc private func togglePermanent() {
         Prefs.permanent.toggle()
     }
@@ -342,6 +409,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func displayTopologyChanged() {
+        Diag.snapshot("拓扑变化", controller)
         DispatchQueue.main.async { [weak self] in self?.updateStatusIcon() }
         // 恢复走后台队列，主线程此刻可能正被系统节流。
         watchQueue.async { [weak self] in
@@ -358,6 +426,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 不能只看「内建屏关着且没有外置屏」：失去全部物理屏之后，内建屏的槽位
     /// 会从枚举里消失，系统还会塞一块虚拟屏进来冒充在用。所以判据是
     /// isStranded（没有任何真屏在亮），恢复走 emergencyRestoreBuiltin 的三级降级。
+    /// 看护心跳。定时器每秒一跳，间隔要是明显拉长，就说明进程被系统节流了——
+    /// 这正是拔线后来不及恢复的头号嫌疑，所以要留下证据。
+    private var lastBeat = Date()
+    private func heartbeat() {
+        let now = Date()
+        let gap = now.timeIntervalSince(lastBeat)
+        lastBeat = now
+        if gap > 3.0 {
+            Diag.log("⚠︎ 看护间隔 \(String(format: "%.1f", gap))s（预期 1s）——进程很可能被挂起过")
+        } else if Int(now.timeIntervalSince1970) % 10 == 0 {
+            Diag.log("看护心跳 +\(String(format: "%.1f", gap))s")
+        }
+    }
+
     /// 可以在任意队列调用——只有刷新图标会回到主线程。
     private func restoreIfStranded() {
         guard Prefs.autoRestore else { return }
@@ -366,7 +448,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             controller.rememberDisplays()
             return
         }
+        Diag.snapshot("!! 没有真屏亮着，开始恢复", controller)
         controller.emergencyRestoreBuiltin()
+        Diag.snapshot("恢复之后", controller)
         DispatchQueue.main.async { [weak self] in self?.updateStatusIcon() }
     }
 
