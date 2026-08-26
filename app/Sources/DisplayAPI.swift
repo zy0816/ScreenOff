@@ -17,6 +17,7 @@ private typealias BeginConfigFn = @convention(c) (UnsafeMutablePointer<OpaquePoi
 private typealias ConfigureEnabledFn = @convention(c) (OpaquePointer?, CGDirectDisplayID, Bool) -> CGError
 private typealias CompleteConfigFn = @convention(c) (OpaquePointer?, UInt32) -> CGError
 private typealias CancelConfigFn = @convention(c) (OpaquePointer?) -> CGError
+private typealias DetectDisplaysFn = @convention(c) () -> CGError
 
 /// CGConfigureOption
 private let kConfigureForSession: UInt32 = 1
@@ -45,6 +46,7 @@ final class DisplayAPI {
     private let configureEnabled: ConfigureEnabledFn?
     private let completeConfig: CompleteConfigFn?
     private let cancelConfig: CancelConfigFn?
+    private let detect: DetectDisplaysFn?
 
     var isAvailable: Bool {
         getDisplayList != nil && beginConfig != nil
@@ -66,6 +68,7 @@ final class DisplayAPI {
         configureEnabled = sym("CGSConfigureDisplayEnabled", as: ConfigureEnabledFn.self)
         completeConfig = sym("CGSCompleteDisplayConfiguration", as: CompleteConfigFn.self)
         cancelConfig = sym("CGCancelDisplayConfiguration", as: CancelConfigFn.self)
+        detect = sym("CGSDetectDisplays", as: DetectDisplaysFn.self)
     }
 
     /// 全部显示器槽位，含被禁用的；已滤掉没接东西的空槽。
@@ -113,10 +116,26 @@ final class DisplayAPI {
         return (CGDisplayIsActive(id) != 0) == want
     }
 
+    /// 让 WindowServer 重新探测显示器硬件，相当于旧版系统设置里的「检测显示器」。
+    ///
+    /// 这是掉进无物理屏状态后唯一还讲得通的路子：那时候所有 display ID 都已失效，
+    /// 连只针对内建屏 ID 的事务都会被 kCGErrorIllegalArgument 拒掉，
+    /// 光靠 enable 谁都没用，得先让系统重新发现硬件。
+    @discardableResult
+    func detectDisplays() -> Bool {
+        guard let detect else { return false }
+        return detect() == .success
+    }
+
     /// 应急：一个事务里把给定的一批 ID 全部点亮。
     ///
-    /// 掉进「无物理屏」状态后，内建屏的槽位从 CGSGetDisplayList 里消失，
-    /// 单独对记住的 ID 调 setEnabled 实测没有效果，只有这样批量提交才拉得回来。
+    /// 掉进「无物理屏」状态后，内建屏的槽位从 CGSGetDisplayList 里消失。
+    ///
+    /// 注意：这一步不一定有用。在开发机上它曾把内建屏拉回来过，但另一台机器实测
+    /// 表明，那时候连只针对内建屏 ID 的事务都会被 kCGErrorIllegalArgument 拒掉——
+    /// display ID 本身已经失效，enable 谁都没用（开发机那次很可能是先前调用的
+    /// CGRestorePermanentDisplayConfiguration 延迟生效，被误记在了这一步头上）。
+    /// 所以真正的指望在 detectDisplays()，这里只作为最后的尝试保留。
     ///
     /// 注意 ID 必须由调用方给出真实值，不能靠猜范围：CGDirectDisplayID 是不透明的
     /// uint32，某些机器上是 1、2、3 这样的小数字，另一些机器上是 69733248 这类大数，
@@ -291,6 +310,14 @@ final class DisplayController {
     ///   2. 用记住的 ID 单独点亮
     ///   3. 批量点亮所有 ID（实测唯一在无物理屏状态下有效的办法）
     func emergencyRestoreBuiltin() {
+        // 0. 先让系统重新探测硬件。stranded 状态下 display ID 全部失效，
+        //    针对 ID 的事务一律被拒，得先让硬件重新被发现，后面几步才有意义。
+        if isStranded {
+            api.detectDisplays()
+            if let id = rememberedBuiltinID,
+               DisplayAPI.waitForActive(id, true, timeout: 4.0) { return }
+        }
+
         if let builtin, !builtin.isActive {
             try? api.setEnabled(true, for: builtin.id, permanent: false)
             if DisplayAPI.waitForActive(builtin.id, true) { return }

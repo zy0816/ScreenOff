@@ -1,0 +1,47 @@
+[11:11:03.371666] ======================================================================
+[11:11:03.378095] 初始状态：1内建=亮 | 2外接=灭 | 3外接=灭
+[11:11:03.378633] [
+ {
+  "id": 1,
+  "builtin": true,
+  "active": true,
+  "online": true,
+  "asleep": false,
+  "main": true,
+  "size": "1512x982",
+  "unit": 0,
+  "vendor": "0x610",
+  "model": "0xa05e",
+  "uuid": true,
+  "virtual": false
+ },
+ {
+  "id": 2,
+  "builtin": false,
+  "active": false,
+  "online": false,
+  "asleep": false,
+  "main": false,
+  "size": "1x1",
+  "unit": 1,
+  "vendor": "0x4cf4",
+  "model": "0x1",
+  "uuid": false,
+  "virtual": false
+ },
+ {
+  "id": 3,
+  "builtin": false,
+  "active": false,
+  "online": false,
+  "asleep": false,
+  "main": false,
+  "size": "1x1",
+  "unit": 2,
+  "vendor": "0x4cf4",
+  "model": "0x1",
+  "uuid": false,
+  "virtual": false
+ }
+]
+[11:11:03.378655] （--snapshot：只采集状态，不做任何改动）

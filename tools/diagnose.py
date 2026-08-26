@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-诊断「拔掉外接屏后内建屏恢复不了」。
+诊断「拔掉外接屏后内建屏恢复不了」（第 2 轮）。
 
 它会全程采样显示器状态，并在检测到没有任何真屏亮着时，依次尝试几种恢复手段，
 把每一种是否奏效都记下来 —— 目的是在你的机器上直接测出哪种有效，而不是靠猜。
@@ -38,6 +38,10 @@ sl.CGSConfigureDisplayEnabled.restype = ctypes.c_int32
 sl.CGSCompleteDisplayConfiguration.argtypes = [CFG, u32]
 sl.CGSCompleteDisplayConfiguration.restype = ctypes.c_int32
 cg.CGRestorePermanentDisplayConfiguration.restype = ctypes.c_int32
+# 强制让 WindowServer 重新探测显示器硬件——相当于旧版系统设置里的「检测显示器」。
+# stranded 状态下所有 display ID 都失效了，重新探测是少数还讲得通的路子。
+sl.CGSDetectDisplays.argtypes = []
+sl.CGSDetectDisplays.restype = ctypes.c_int32
 
 for f in ("CGDisplayIsBuiltin", "CGDisplayIsActive", "CGDisplayIsOnline",
           "CGDisplayIsAsleep", "CGDisplayIsMain", "CGDisplayPixelsWide",
@@ -106,13 +110,17 @@ def brief(snap):
     )
 
 
-def enable(ids, option=1):
-    """一个事务里 enable 一批 ID。返回 (每个的 rc, 提交的 rc)。"""
+def enable_flag(ids, flag, option=1):
+    """一个事务里把一批 ID 设成 flag。返回 (每个的 rc, 提交的 rc)。"""
     c = CFG()
     if sl.CGSBeginDisplayConfiguration(ctypes.byref(c)) != 0:
         return None, None
-    rcs = {i: sl.CGSConfigureDisplayEnabled(c, i, True) for i in ids}
+    rcs = {i: sl.CGSConfigureDisplayEnabled(c, i, flag) for i in ids}
     return rcs, sl.CGSCompleteDisplayConfiguration(c, option)
+
+
+def enable(ids, option=1):
+    return enable_flag(ids, True, option)
 
 
 def builtin_lit():
@@ -176,24 +184,42 @@ def main():
     log("-" * 70)
     log("开始依次尝试恢复手段：")
 
+    def detect():
+        return f"CGSDetectDisplays() -> {sl.CGSDetectDisplays()}"
+
+    def disable_virtual():
+        virt = [s["id"] for s in snapshot() if s["virtual"]]
+        if not virt:
+            return "没有虚拟屏可关"
+        return f"disable {virt} -> {enable_flag(virt, False)}"
+
+    def disable_virtual_then_detect():
+        r1 = disable_virtual()
+        time.sleep(1.5)
+        return f"{r1}；然后 {detect()}"
+
+    def detect_then_enable():
+        r1 = detect()
+        time.sleep(2.0)
+        ids = sorted(set(builtin_ids) | set(slots()))
+        return f"{r1}；然后 enable {ids} -> {enable(ids, 1)}"
+
+    # 上一轮已经证明：单纯 enable 任何 ID 都会被 1001 拒绝，因为 stranded 状态下
+    # display ID 已经失效。所以这一轮把重点放在「让系统重新发现硬件」上。
     methods = [
-        ("A. 单独 enable 内建屏 ID（会话级）",
-         lambda: enable(builtin_ids, 1)),
-        ("B. 单独 enable 内建屏 ID（永久级）",
-         lambda: enable(builtin_ids, 2)),
-        ("C. 批量 enable 见过的所有 ID",
-         lambda: enable(known_ids, 1)),
-        ("D. 批量 enable 0..40",
-         lambda: enable(list(range(41)), 1)),
-        ("E. 批量 enable 见过的 ID + 0..40 + 当前枚举到的",
-         lambda: enable(sorted(set(known_ids) | set(range(41)) | set(slots())), 1)),
-        ("F. CGRestorePermanentDisplayConfiguration",
-         lambda: cg.CGRestorePermanentDisplayConfiguration()),
+        ("A. CGSDetectDisplays（强制重新探测硬件）", detect, 6.0),
+        ("B. 关掉那块虚拟屏", disable_virtual, 6.0),
+        ("C. 关掉虚拟屏 + 重新探测", disable_virtual_then_detect, 6.0),
+        ("D. 重新探测 + 再 enable 内建屏", detect_then_enable, 6.0),
+        ("E. CGRestorePermanentDisplayConfiguration（等久一点）",
+         lambda: f"-> {cg.CGRestorePermanentDisplayConfiguration()}", 10.0),
+        ("F. 批量 enable（上一轮已知无效，留作对照）",
+         lambda: enable(sorted(set(known_ids) | set(range(41))), 1), 4.0),
     ]
 
     winner = None
-    for name, fn in methods:
-        if try_method(name, fn):
+    for name, fn, settle in methods:
+        if try_method(name, fn, settle):
             winner = name
             break
 
