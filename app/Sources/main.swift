@@ -5,7 +5,7 @@
 import AppKit
 import ServiceManagement
 
-let appVersion = "1.1"
+let appVersion = "1.2"
 
 // MARK: - 偏好设置
 
@@ -32,14 +32,17 @@ private let reconfigurationCallback: CGDisplayReconfigurationCallBack = { _, fla
     let interesting: CGDisplayChangeSummaryFlags = [.removeFlag, .disabledFlag, .setModeFlag]
     guard !flags.intersection(interesting).isEmpty else { return }
     let delegate = Unmanaged<AppDelegate>.fromOpaque(userInfo).takeUnretainedValue()
-    DispatchQueue.main.async { delegate.displayTopologyChanged() }
+    delegate.displayTopologyChanged()
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let controller = DisplayController()
     private let menu = NSMenu()
-    private var guardTimer: Timer?
+    /// 看护跑在自己的队列上，不依赖主 runloop —— 屏幕全没之后主线程未必还在转。
+    private let watchQueue = DispatchQueue(label: "displaytoggle.watchdog", qos: .userInitiated)
+    private var watchTimer: DispatchSourceTimer?
+    private var activityToken: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard DisplayAPI.shared.isAvailable else {
@@ -68,11 +71,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             reconfigurationCallback, Unmanaged.passUnretained(self).toOpaque()
         )
 
+        // 挡住 App Nap：屏幕全部消失后，系统很可能把这个后台 App 节流甚至挂起，
+        // 那样 Timer 不再触发、main queue 也不再排空，恢复逻辑根本没机会跑。
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "监视显示器丢失，以便把内建屏恢复回来"
+        )
+
         // 兜底看护：通知和回调都可能在极端状态下失灵，轮询是最后一道保险。
-        // 一次几个 CG 调用，开销可以忽略。
-        guardTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        // 一次几个 CG 调用，开销可以忽略。用 DispatchSourceTimer 而不是 Timer，
+        // 后者挂在主 runloop 上，主线程一被节流就跟着停。
+        let timer = DispatchSource.makeTimerSource(queue: watchQueue)
+        timer.schedule(deadline: .now() + 1.0, repeating: 1.0, leeway: .milliseconds(200))
+        timer.setEventHandler { [weak self] in
             self?.restoreIfStranded()
         }
+        timer.resume()
+        watchTimer = timer
 
         controller.rememberDisplays()
         updateStatusIcon()
@@ -312,7 +327,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if !controller.isBuiltinOn && !controller.hasExternal {
             _ = try? controller.setBuiltin(true, permanent: Prefs.permanent)
         }
-        guardTimer?.invalidate()
+        watchTimer?.cancel()
+        if let activityToken { ProcessInfo.processInfo.endActivity(activityToken) }
         CGDisplayRemoveReconfigurationCallback(
             reconfigurationCallback, Unmanaged.passUnretained(self).toOpaque()
         )
@@ -326,12 +342,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func displayTopologyChanged() {
-        updateStatusIcon()
-        restoreIfStranded()
-        // 拔线瞬间状态还在抖，稍后再确认一次。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+        DispatchQueue.main.async { [weak self] in self?.updateStatusIcon() }
+        // 恢复走后台队列，主线程此刻可能正被系统节流。
+        watchQueue.async { [weak self] in
             self?.restoreIfStranded()
-            self?.updateStatusIcon()
+            // 拔线瞬间状态还在抖，稍后再确认一次。
+            Thread.sleep(forTimeInterval: 0.8)
+            self?.restoreIfStranded()
+            DispatchQueue.main.async { [weak self] in self?.updateStatusIcon() }
         }
     }
 
@@ -340,6 +358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 不能只看「内建屏关着且没有外置屏」：失去全部物理屏之后，内建屏的槽位
     /// 会从枚举里消失，系统还会塞一块虚拟屏进来冒充在用。所以判据是
     /// isStranded（没有任何真屏在亮），恢复走 emergencyRestoreBuiltin 的三级降级。
+    /// 可以在任意队列调用——只有刷新图标会回到主线程。
     private func restoreIfStranded() {
         guard Prefs.autoRestore else { return }
         guard controller.isStranded else {
@@ -348,9 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         controller.emergencyRestoreBuiltin()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            self?.updateStatusIcon()
-        }
+        DispatchQueue.main.async { [weak self] in self?.updateStatusIcon() }
     }
 
     // MARK: 提示
