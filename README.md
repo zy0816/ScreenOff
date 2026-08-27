@@ -147,15 +147,19 @@ is still lit" — so nothing gets restored. The user is left with a black screen
 So the condition to check is not "built-in is off and there's no external display". It has to be
 **`isStranded`: no *real* display is lit**, where "real" excludes the virtual one.
 
-Worse, the private API itself becomes unreliable in that state: calling
-`CGSConfigureDisplayEnabled` on the remembered built-in ID **does nothing at all**. The only
-thing that brings it back is enabling a batch of IDs inside a single transaction. Hence a
-three-stage fallback:
+Recovery is a three-stage fallback:
 
 1. Built-in display still enumerable — normal path
 2. Enable the remembered ID directly (so the ID must be persisted *before* turning it off)
-3. Batch-enable in one transaction — the only approach verified to work with no physical
-   display attached
+3. Batch-enable in one transaction
+
+**What decides success is speed, not which stage you reach.** Recovery only works inside a
+narrow window: the display IDs go invalid moments after the unplug, and once they do, nothing
+works. So the first `enable` must go out with zero delay — any slow step ahead of it
+(re-detecting hardware, waiting for state to settle) amounts to giving up. Version 1.2 put a
+four second wait there and broke machines that had always recovered fine.
+
+Miss the window and on some machines it is unrecoverable — see [Known issue](#known-issue-some-macs-cannot-auto-recover-after-an-unplug).
 
 Two things about stage 3 that are easy to get wrong:
 
@@ -192,6 +196,32 @@ surprises people, so the menu says so up front and offers to switch the main dis
 macOS has no "make this the main display" call. The trick is to move the target display's origin
 to `(0,0)` and translate every other display by the same offset (`CGConfigureDisplayOrigin`,
 a public API), leaving the relative arrangement intact.
+
+## Known issue: some Macs cannot auto-recover after an unplug
+
+**The failure reports so far are concentrated on M3 machines.**
+
+On those, unplugging the external display while the built-in one is off leaves the screen
+black, and no software approach brings it back. In that state the display IDs are simply
+invalid, and all of the following were measured to fail:
+
+- Enabling the built-in display ID alone (session or permanent) — the commit returns
+  `kCGErrorIllegalArgument` even when the transaction touches nothing else
+- Batch-enabling every known ID, or `0..40`
+- `CGSDetectDisplays` to force a hardware rescan
+- Disabling the virtual display (the transaction succeeds; the system immediately makes another)
+- `CGRestorePermanentDisplayConfiguration`
+
+**If you hit the black screen: close the lid and open it again.** That is a hardware-level
+display re-enumeration and is the only method confirmed to work. Plugging the external
+display back in also works.
+
+The likely explanation is that the display coprocessor on these machines releases the
+built-in framebuffer once every physical display is gone, leaving nothing for software to
+re-acquire — so only a real hardware event re-initialises it. **This remains unconfirmed.**
+
+If this affects you, enable **Diagnostic log** in the menu, reproduce, and attach
+`~/Library/Logs/DisplayToggle.log` to an issue — it records the chip and model.
 
 ## Known caveat
 

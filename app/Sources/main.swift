@@ -5,7 +5,7 @@
 import AppKit
 import ServiceManagement
 
-let appVersion = "1.3"
+let appVersion = "1.4"
 
 // MARK: - 偏好设置
 
@@ -25,9 +25,30 @@ enum Prefs {
         get { d.bool(forKey: "diagnosticLog") }
         set { d.set(newValue, forKey: "diagnosticLog") }
     }
+    /// 第一次关内建屏时提醒一次拔线的风险，之后不再打扰。
+    static var warnedAboutUnplug: Bool {
+        get { d.bool(forKey: "warnedAboutUnplug") }
+        set { d.set(newValue, forKey: "warnedAboutUnplug") }
+    }
 }
 
 // MARK: - 诊断日志
+
+/// 机器信息。目前收到的失败报告集中在某一代芯片上，所以日志里必须带上它。
+enum Machine {
+    static func sysctl(_ name: String) -> String {
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return "?" }
+        var buf = [CChar](repeating: 0, count: size)
+        guard sysctlbyname(name, &buf, &size, nil, 0) == 0 else { return "?" }
+        return String(cString: buf)
+    }
+    static let chip = sysctl("machdep.cpu.brand_string")
+    static let model = sysctl("hw.model")
+    static var summary: String {
+        "\(chip) / \(model) / macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
+    }
+}
 
 enum Diag {
     static let path = FileManager.default
@@ -140,6 +161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         controller.rememberDisplays()
         Diag.log("=== App 启动 v\(appVersion) ===")
+        Diag.log(Machine.summary)
         Diag.snapshot("启动时", controller)
         updateStatusIcon()
         restoreIfStranded()
@@ -316,6 +338,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // 关屏前务必记住 ID：一旦外置屏随后也没了，这是唯一还能定位内建屏的线索。
         controller.rememberDisplays()
+
+        // 有些机型（目前的报告集中在 M3）一旦掉进无物理屏状态，软件层面
+        // 再也点不亮内建屏——只有合盖再打开这种硬件事件能救。既然做不到
+        // 保证恢复，至少得让用户事先知道自救办法。
+        if on && !Prefs.warnedAboutUnplug {
+            Prefs.warnedAboutUnplug = true
+            notify("关掉之后别拔线",
+                   """
+                   关掉内建屏后，如果拔掉外接显示器，绝大多数机器会自动把内建屏亮回来。
+
+                   但有些机型不行，屏幕会全黑。真遇到了不用慌：
+                   合上笔记本盖子，再打开，屏幕就回来了。
+                   """)
+        }
         do {
             try controller.setBuiltin(!on, permanent: Prefs.permanent)
         } catch {
