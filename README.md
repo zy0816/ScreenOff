@@ -266,8 +266,19 @@ Turning the display off relocates its windows to the other monitor, and turning 
 
 ## Compatibility
 
-Verified on macOS 27.0 (M4 Pro, Apple Silicon). The app targets macOS 13 and up. Private symbols
-can disappear at any release; both implementations check at startup and fail with a clear message.
+- macOS 27.0 / M4 Pro: the built-in display comes back immediately after an unplug — the
+  display IDs are still valid at that moment
+- macOS 26.6.2 / M3: the IDs go invalid at once, so recovery goes through sleep/wake and takes
+  about 7 seconds. **Verified working.**
+
+The app targets macOS 13 and up. Private symbols can disappear at any release; both
+implementations check at startup and fail with a clear message rather than misbehaving.
+
+What differs between the two machines is how long a display ID stays usable after the unplug.
+On the M4 there is a window and the first `enable` catches it; on the M3 the slot is already
+gone by the time the notification arrives, leaving sleep/wake as the only route. Whether that
+difference comes down to the chip, the OS version or the cabling isn't something the current
+sample can settle — fortunately the recovery targets the *state* of invalid IDs, not its cause.
 
 ## License
 

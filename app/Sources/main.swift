@@ -5,7 +5,7 @@
 import AppKit
 import ServiceManagement
 
-let appVersion = "1.6"
+let appVersion = "1.7"
 
 // MARK: - 偏好设置
 
@@ -384,7 +384,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleDiagnostics() {
         Prefs.diagnosticLog.toggle()
         if Prefs.diagnosticLog {
-            Diag.log("=== 开始记录 ===")
+            // 机型必须在这里也记一次：多数人是 App 已经在跑之后才打开开关的，
+            // 只在启动时记的话，收到的日志里就没有机型——排查时全靠转述。
+            Diag.log("=== 开始记录 v\(appVersion) ===")
+            Diag.log(Machine.summary)
             Diag.snapshot("当前", controller)
             if let p = Diag.path {
                 notify("已开始记录诊断日志", "日志位置：\n\(p.path)\n\n复现问题后，把这个文件发出来。")

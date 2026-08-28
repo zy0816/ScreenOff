@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 
 APP_NAME="DisplayToggle"
 BUNDLE_ID="com.zy0816.displaytoggle"
-VERSION="1.6"
+VERSION="1.7"
 MIN_MACOS="13.0"
 
 BUILD="build"
