@@ -75,6 +75,17 @@ if let maxID = remembered.rememberedIDs.max() {
 //    任何前置阻塞都等于放弃。第一个 enable 必须立刻发出去。
 //  · 1.5 在链尾加了睡眠→唤醒（约 6 秒）。内建屏还在枚举里时绝不能走到那一步，
 //    所以这个 1.5 秒的上限同时守住了「正常机器不受新逻辑影响」。
+// 这条防的是 1.5 的 bug：waitForActive 曾直接判断 CGDisplayIsActive(id) != 0，
+// 而该函数对失效 ID 返回 0xFFFFFFFF（错误码），于是被当成「屏幕亮着」，
+// 恢复链第一步就误判成功提前退出，真正管用的睡眠→唤醒永远轮不到。
+print("== 失效 ID 不能被当成亮着")
+let bogus: CGDirectDisplayID = 99999
+print("    CGDisplayIsActive(\(bogus)) 原始返回 = \(CGDisplayIsActive(bogus))")
+check("对不存在的 ID，waitForActive(want:true) 必须为假",
+      !DisplayAPI.waitForActive(bogus, true, timeout: 0.3))
+check("不存在的 ID 不会混进枚举",
+      !DisplayController().displays.contains { $0.id == bogus })
+
 print("== 紧急恢复的延迟")
 let t0 = Date()
 DisplayController().emergencyRestoreBuiltin()

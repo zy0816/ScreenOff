@@ -5,7 +5,7 @@
 import AppKit
 import ServiceManagement
 
-let appVersion = "1.5"
+let appVersion = "1.6"
 
 // MARK: - 偏好设置
 

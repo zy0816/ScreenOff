@@ -106,14 +106,22 @@ final class DisplayAPI {
     }
 
     /// 轮询等某块屏的开关状态落定。显示配置是异步生效的。
+    ///
+    /// 判断必须以枚举结果为准，**不能直接信 CGDisplayIsActive**：display ID 一旦失效，
+    /// 那个函数仍会返回「亮着」，于是恢复链第一步就误判成功、直接返回，
+    /// 后面真正管用的睡眠→唤醒永远轮不到。实测日志里整条恢复只花 0～300ms
+    /// （光睡眠唤醒就要 6 秒）就是这么来的。
     static func waitForActive(_ id: CGDirectDisplayID, _ want: Bool,
                               timeout: TimeInterval = 2.0) -> Bool {
+        func settled() -> Bool {
+            shared.displays().contains { $0.id == id && $0.isActive } == want
+        }
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if (CGDisplayIsActive(id) != 0) == want { return true }
+            if settled() { return true }
             usleep(150_000)
         }
-        return (CGDisplayIsActive(id) != 0) == want
+        return settled()
     }
 
     /// 让 WindowServer 重新探测显示器硬件，相当于旧版系统设置里的「检测显示器」。
@@ -201,12 +209,15 @@ struct DisplayInfo {
     let model: UInt32
 
     init(_ id: CGDirectDisplayID) {
+        // 这些 boolean_t 在 ID 无效时返回 0xFFFFFFFF（错误码），不是 0/1。
+        // 写成 != 0 会把错误当成「真」——1.5 的恢复失效就是这么来的，
+        // 所以一律只认 1。
         self.id = id
-        isBuiltin = CGDisplayIsBuiltin(id) != 0
-        isActive = CGDisplayIsActive(id) != 0
-        isOnline = CGDisplayIsOnline(id) != 0
-        isAsleep = CGDisplayIsAsleep(id) != 0
-        isMain = CGDisplayIsMain(id) != 0
+        isBuiltin = CGDisplayIsBuiltin(id) == 1
+        isActive = CGDisplayIsActive(id) == 1
+        isOnline = CGDisplayIsOnline(id) == 1
+        isAsleep = CGDisplayIsAsleep(id) == 1
+        isMain = CGDisplayIsMain(id) == 1
         vendor = CGDisplayVendorNumber(id)
         model = CGDisplayModelNumber(id)
         if let mode = CGDisplayCopyDisplayMode(id) {
@@ -335,6 +346,9 @@ final class DisplayController {
     ///   2. 用记住的 ID 单独点亮
     ///   3. 批量点亮所有 ID（实测唯一在无物理屏状态下有效的办法）
     func emergencyRestoreBuiltin() {
+        // 合盖不是故障：内建屏还在枚举里，只是 asleep。这时候去唤醒机器是帮倒忙。
+        if let builtin, builtin.isAsleep { return }
+
         // 恢复是个极窄的窗口：拔线之后 display ID 很快就会失效，赶上了 enable 就管用，
         // 赶不上做什么都没用。所以第一步必须零延迟——先把 enable 发出去，
         // 别在它前面放任何慢动作（探测硬件、等状态落定都算慢动作）。
@@ -350,21 +364,21 @@ final class DisplayController {
                DisplayAPI.waitForActive(id, true, timeout: 1.0) { return }
         }
 
-        // 到这儿说明窗口已经错过了，才轮到这些慢办法碰运气。
-        api.detectDisplays()
-        if let id = rememberedBuiltinID,
-           DisplayAPI.waitForActive(id, true, timeout: 3.0) { return }
+        // 内建屏还在枚举里，说明 ID 仍然有效，再试几种便宜办法值得。
+        // 反过来，它要是已经消失，这些针对 ID 的操作注定失败，别拿黑屏时间去换。
+        if builtin != nil {
+            api.detectDisplays()
+            if let id = rememberedBuiltinID,
+               DisplayAPI.waitForActive(id, true, timeout: 2.0) { return }
 
-        api.forceEnable(recoveryCandidates())
-        if let id = rememberedBuiltinID,
-           DisplayAPI.waitForActive(id, true, timeout: 1.0) { return }
+            api.forceEnable(recoveryCandidates())
+            if let id = rememberedBuiltinID,
+               DisplayAPI.waitForActive(id, true, timeout: 1.0) { return }
+        }
 
-        // 最后一招：内建屏已经从枚举里消失，说明 ID 全失效了，
-        // 上面那些针对 ID 的操作不可能成功。用睡眠→唤醒绕开 ID。
-        //
-        // 只在内建屏真的消失时才用：合盖的时候它还在枚举里（asleep），
-        // 那种情况下把机器唤醒是帮倒忙。
-        if builtin == nil, canSleepWakeNow {
+        // 最后一招：用睡眠→唤醒绕开已经失效的 ID。
+        // 这是唯一验证过能从那个状态里出来的办法。
+        if canSleepWakeNow {
             lastSleepWake = Date()
             api.sleepWakeDisplays()
         }

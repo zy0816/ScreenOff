@@ -233,7 +233,31 @@ actually vanished from the enumeration — with the lid closed it is still there
 `asleep`, and waking the machine then would be actively unhelpful. A 30 second cooldown keeps
 the once-per-second watchdog from putting the machine to sleep over and over.
 
-If even that fails: **close the lid and open it again**, or plug the external display back in.
+### A subtle trap: `CGDisplayIsActive` lies about invalid IDs
+
+Wiring this into the app did not work at first — it ran fine as a script but the app never
+executed it. Success was being checked with:
+
+```swift
+CGDisplayIsActive(id) != 0
+```
+
+These `boolean_t` functions return **`0xFFFFFFFF` (an error code) for an invalid ID**, not 0
+or 1:
+
+```
+CGDisplayIsActive(99999) = 4294967295
+```
+
+So `!= 0` read the error as "the display is on", the first stage of recovery declared success
+and returned, and the sleep/wake stage was never reached. That is why the log showed the whole
+recovery finishing in 0–300ms when sleep/wake alone takes six seconds.
+
+Two fixes follow: decide display state **from the enumeration**, not by asking these functions
+directly; and where their return value is used at all, test `== 1`, never `!= 0`.
+
+If even sleep/wake fails: **close the lid and open it again**, or plug the external display
+back in.
 
 ## Known caveat
 
