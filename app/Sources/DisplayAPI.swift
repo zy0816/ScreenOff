@@ -83,7 +83,8 @@ final class DisplayAPI {
         return ids.prefix(Int(count)).map(DisplayInfo.init).filter { !$0.isPhantom }
     }
 
-    func setEnabled(_ enabled: Bool, for id: CGDirectDisplayID, permanent: Bool) throws {
+    func setEnabled(_ enabled: Bool, for id: CGDirectDisplayID, permanent: Bool,
+                    verifyTimeout: TimeInterval = 6.0) throws {
         guard let beginConfig, let configureEnabled, let completeConfig else {
             throw DisplayAPIError.symbolsMissing
         }
@@ -100,7 +101,10 @@ final class DisplayAPI {
         rc = completeConfig(config, permanent ? kConfigurePermanently : kConfigureForSession)
         // 提交的返回码不可信：显示器拓扑异常时它经常返回 kCGErrorIllegalArgument(1001)，
         // 而屏幕其实已经亮了。所以以真实状态为准，只有状态确实没变才当失败。
-        if rc != .success, !Self.waitForActive(id, enabled) {
+        //
+        // 超时给得比较宽：把屏幕点亮比关掉慢得多，有些机器要好几秒。
+        // 判早了就会在操作其实成功的情况下弹一个假的错误框。
+        if rc != .success, !Self.waitForActive(id, enabled, timeout: verifyTimeout) {
             throw DisplayAPIError.callFailed("CGSCompleteDisplayConfiguration", rc)
         }
     }
@@ -308,8 +312,35 @@ final class DisplayController {
     func setBuiltin(_ on: Bool, permanent: Bool) throws -> Bool {
         guard let builtin else { return false }
         guard builtin.isActive != on else { return false }
-        try api.setEnabled(on, for: builtin.id, permanent: permanent)
-        return true
+        let id = builtin.id
+
+        // 先按常规提交。验证时间给短一点，好尽快判断要不要上兜底手段。
+        try? api.setEnabled(on, for: id, permanent: permanent, verifyTimeout: 3.0)
+        if DisplayAPI.waitForActive(id, on, timeout: 0.5) { return true }
+
+        // 关不掉就是真关不掉，没有别的办法。
+        guard on else {
+            throw DisplayAPIError.callFailed("CGSConfigureDisplayEnabled", .failure)
+        }
+
+        // 先试最便宜的一招：关闭是会话级的，永久配置里内建屏本来就是启用的，
+        // 让系统恢复永久配置往往就把它点回来了，而且不会闪屏。
+        // （这招在「拔线后 ID 全失效」时没用过——那时它救不了；
+        //   但眼下 ID 还在，情况不一样。）
+        CGRestorePermanentDisplayConfiguration()
+        if DisplayAPI.waitForActive(id, true, timeout: 2.5) { return true }
+
+        // 点不亮的情况有救：有些机器光提交配置不算数，显示拓扑得真正重建一次才认。
+        // 睡眠→唤醒正是干这个的——拔线恢复用的也是同一招。
+        // 代价是所有屏幕会闪一下，约 6 秒，但总好过打不开。
+        api.sleepWakeDisplays()
+        if DisplayAPI.waitForActive(id, true, timeout: 4.0) { return true }
+
+        // 唤醒之后再提交一次：拓扑刚重建，这时候 ID 通常又认了。
+        try? api.setEnabled(true, for: id, permanent: permanent, verifyTimeout: 3.0)
+        if DisplayAPI.waitForActive(id, true, timeout: 1.0) { return true }
+
+        throw DisplayAPIError.callFailed("打开内建屏（已尝试睡眠唤醒）", .failure)
     }
 
     /// 把某块屏设为主显示器（菜单栏和 Dock 所在的那块）。

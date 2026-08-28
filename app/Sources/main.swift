@@ -5,7 +5,7 @@
 import AppKit
 import ServiceManagement
 
-let appVersion = "1.7"
+let appVersion = "1.8"
 
 // MARK: - 偏好设置
 
@@ -29,6 +29,11 @@ enum Prefs {
     static var warnedAboutUnplug: Bool {
         get { d.bool(forKey: "warnedAboutUnplug") }
         set { d.set(newValue, forKey: "warnedAboutUnplug") }
+    }
+    /// 接上外置屏时自动关掉内建屏。默认关——这事得用户自己要求才做。
+    static var autoDisableOnConnect: Bool {
+        get { d.bool(forKey: "autoDisableOnConnect") }
+        set { d.set(newValue, forKey: "autoDisableOnConnect") }
     }
 }
 
@@ -112,6 +117,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let watchQueue = DispatchQueue(label: "displaytoggle.watchdog", qos: .userInteractive)
     private var watchTimer: DispatchSourceTimer?
     private var activityToken: NSObjectProtocol?
+    /// 上一次见到的外接屏，用来分辨「新接上了一块」和「本来就接着」。
+    /// 只在 watchQueue 上读写。
+    private var knownExternals = Set<CGDirectDisplayID>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard DisplayAPI.shared.isAvailable else {
@@ -160,6 +168,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watchTimer = timer
 
         controller.rememberDisplays()
+        // 启动时先把现状记下来，否则会把「本来就接着的屏」当成刚接上而误关内建屏
+        knownExternals = Set(controller.externalsLit.map(\.id))
         Diag.log("=== App 启动 v\(appVersion) ===")
         Diag.log(Machine.summary)
         Diag.snapshot("启动时", controller)
@@ -287,6 +297,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        let autoOff = NSMenuItem(title: "接上外置屏时自动关闭内建屏",
+                                 action: #selector(toggleAutoDisable), keyEquivalent: "")
+        autoOff.target = self
+        autoOff.state = Prefs.autoDisableOnConnect ? .on : .off
+        menu.addItem(autoOff)
+
         let auto = NSMenuItem(title: "拔掉外置屏时自动恢复", action: #selector(toggleAutoRestore), keyEquivalent: "")
         auto.target = self
         auto.state = Prefs.autoRestore ? .on : .off
@@ -338,6 +354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // 关屏前务必记住 ID：一旦外置屏随后也没了，这是唯一还能定位内建屏的线索。
         controller.rememberDisplays()
+        Diag.log("手动切换：目标=\(on ? "关闭" : "打开")")
 
         // 有些机型（目前的报告集中在 M3）一旦掉进无物理屏状态，软件层面
         // 再也点不亮内建屏——只有合盖再打开这种硬件事件能救。既然做不到
@@ -354,15 +371,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                    万一超过十几秒还是黑的，合上笔记本盖子再打开即可。
                    """)
         }
+        // 打开内建屏可能要走睡眠唤醒兜底，最长十几秒——放主线程会把菜单卡死。
+        watchQueue.async { [weak self] in
+            guard let self else { return }
+            self.performToggle(turnOn: !on)
+        }
+    }
+
+    private func performToggle(turnOn on: Bool) {
         do {
-            try controller.setBuiltin(!on, permanent: Prefs.permanent)
+            try controller.setBuiltin(on, permanent: Prefs.permanent)
+            Diag.snapshot("切换后", controller)
         } catch {
-            notify("操作失败", error.localizedDescription)
+            // 报错之前再确认一次真实状态。这些私有接口的返回码本来就不可信，
+            // 而且点亮屏幕在有些机器上要好几秒——直接把异常抛给用户，
+            // 就会在操作其实已经成功的情况下弹一个假的失败框。
+            let succeeded = controller.builtin.map { $0.isActive == on } ?? false
+            Diag.log("setBuiltin 抛错（\(error.localizedDescription)），"
+                     + "复查实际状态：\(succeeded ? "其实成功了" : "确实没变")")
+            if !succeeded {
+                DispatchQueue.main.async { [weak self] in
+                    self?.notify("打不开内建屏",
+                                 """
+                                 已经试过常规方式和睡眠唤醒，系统仍然没有点亮它。
+
+                                 可以合上笔记本盖子再打开，通常就回来了。
+                                 """)
+                }
+            }
         }
-        // 显示配置是异步生效的，等它落定再刷新图标。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            self?.updateStatusIcon()
-        }
+        DispatchQueue.main.async { [weak self] in self?.updateStatusIcon() }
     }
 
     @objc private func makeExternalMain() {
@@ -374,6 +412,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             self?.updateStatusIcon()
+        }
+    }
+
+    @objc private func toggleAutoDisable() {
+        Prefs.autoDisableOnConnect.toggle()
+        if Prefs.autoDisableOnConnect {
+            // 现在就接着屏的话，得把它算进「已知」，否则不会立刻生效——
+            // 说清楚这一点，免得用户以为开关坏了。
+            watchQueue.async { [weak self] in
+                guard let self else { return }
+                self.knownExternals = Set(self.controller.externalsLit.map(\.id))
+            }
         }
     }
 
@@ -458,6 +508,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 拔线瞬间状态还在抖，稍后再确认一次。
             Thread.sleep(forTimeInterval: 0.8)
             self?.restoreIfStranded()
+            self?.autoDisableIfNewExternal()
             DispatchQueue.main.async { [weak self] in self?.updateStatusIcon() }
         }
     }
@@ -479,6 +530,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if Int(now.timeIntervalSince1970) % 10 == 0 {
             Diag.log("看护心跳 +\(String(format: "%.1f", gap))s")
         }
+    }
+
+    /// 接上外接屏就把内建屏关掉。
+    ///
+    /// 只在「这块外接屏是新出现的」这一瞬间做一次，绝不做持续检查——
+    /// 否则用户手动把内建屏打开，下一秒就被关回去，这个功能就成了骚扰。
+    private func autoDisableIfNewExternal() {
+        let current = Set(controller.externalsLit.map(\.id))
+        let added = current.subtracting(knownExternals)
+        knownExternals = current
+
+        guard Prefs.autoDisableOnConnect, !added.isEmpty else { return }
+        guard controller.isBuiltinOn, controller.canTurnOff else { return }
+
+        // 刚插上的时候拓扑还在抖（分辨率、主屏都可能再变），等稳一稳再动手
+        Thread.sleep(forTimeInterval: 2.0)
+        guard controller.isBuiltinOn, controller.canTurnOff else { return }
+
+        Diag.log("新接入外接屏 \(added.map(String.init).joined(separator: ","))，自动关闭内建屏")
+        controller.rememberDisplays()
+        _ = try? controller.setBuiltin(false, permanent: Prefs.permanent)
+        Diag.snapshot("自动关闭后", controller)
+        DispatchQueue.main.async { [weak self] in self?.updateStatusIcon() }
     }
 
     /// 可以在任意队列调用——只有刷新图标会回到主线程。
