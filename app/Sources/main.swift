@@ -5,7 +5,7 @@
 import AppKit
 import ServiceManagement
 
-let appVersion = "1.4"
+let appVersion = "1.5"
 
 // MARK: - 偏好设置
 
@@ -344,12 +344,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 保证恢复，至少得让用户事先知道自救办法。
         if on && !Prefs.warnedAboutUnplug {
             Prefs.warnedAboutUnplug = true
-            notify("关掉之后别拔线",
+            notify("拔线之后会自动恢复",
                    """
-                   关掉内建屏后，如果拔掉外接显示器，绝大多数机器会自动把内建屏亮回来。
+                   关掉内建屏后，如果拔掉外接显示器，内建屏会自动亮回来。
 
-                   但有些机型不行，屏幕会全黑。真遇到了不用慌：
-                   合上笔记本盖子，再打开，屏幕就回来了。
+                   有些机型需要多花几秒：屏幕会先黑一下，期间显示器会睡眠再唤醒，
+                   这是正常的，等着就好。
+
+                   万一超过十几秒还是黑的，合上笔记本盖子再打开即可。
                    """)
         }
         do {

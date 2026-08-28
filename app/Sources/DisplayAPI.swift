@@ -127,6 +127,30 @@ final class DisplayAPI {
         return detect() == .success
     }
 
+    /// 让显示子系统走一遍「睡眠 → 唤醒」，相当于用软件做一次合盖再打开。
+    ///
+    /// 这是唯一实测能从「所有 display ID 都已失效」的状态里恢复的办法。
+    /// 掉进那个状态后，针对 ID 的一切操作都会被 kCGErrorIllegalArgument 拒掉，
+    /// 因为系统里已经没有任何句柄指向那块屏幕了；而这一招完全不碰 ID，
+    /// 走的是电源状态切换，跟合盖开盖是同一个机制。
+    ///
+    /// 在一台此前怎么都恢复不了的 M3 上验证通过。整个过程约 6 秒。
+    func sleepWakeDisplays() {
+        func run(_ path: String, _ args: [String]) {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: path)
+            proc.arguments = args
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            try? proc.run()
+            proc.waitUntilExit()
+        }
+        run("/usr/bin/pmset", ["displaysleepnow"])
+        Thread.sleep(forTimeInterval: 3.0)
+        // 声明一次用户活动，把刚睡下去的显示器唤醒
+        run("/usr/bin/caffeinate", ["-u", "-t", "2"])
+    }
+
     /// 应急：一个事务里把给定的一批 ID 全部点亮。
     ///
     /// 掉进「无物理屏」状态后，内建屏的槽位从 CGSGetDisplayList 里消失。
@@ -135,7 +159,8 @@ final class DisplayAPI {
     /// 表明，那时候连只针对内建屏 ID 的事务都会被 kCGErrorIllegalArgument 拒掉——
     /// display ID 本身已经失效，enable 谁都没用（开发机那次很可能是先前调用的
     /// CGRestorePermanentDisplayConfiguration 延迟生效，被误记在了这一步头上）。
-    /// 所以真正的指望在 detectDisplays()，这里只作为最后的尝试保留。
+    /// 真正管用的是 sleepWakeDisplays()——它完全不碰 ID。这一步只作为
+    /// 更便宜的尝试保留在它前面：万一 ID 还有效，这里就能省下一次屏幕闪烁。
     ///
     /// 注意 ID 必须由调用方给出真实值，不能靠猜范围：CGDirectDisplayID 是不透明的
     /// uint32，某些机器上是 1、2、3 这样的小数字，另一些机器上是 69733248 这类大数，
@@ -331,6 +356,29 @@ final class DisplayController {
            DisplayAPI.waitForActive(id, true, timeout: 3.0) { return }
 
         api.forceEnable(recoveryCandidates())
+        if let id = rememberedBuiltinID,
+           DisplayAPI.waitForActive(id, true, timeout: 1.0) { return }
+
+        // 最后一招：内建屏已经从枚举里消失，说明 ID 全失效了，
+        // 上面那些针对 ID 的操作不可能成功。用睡眠→唤醒绕开 ID。
+        //
+        // 只在内建屏真的消失时才用：合盖的时候它还在枚举里（asleep），
+        // 那种情况下把机器唤醒是帮倒忙。
+        if builtin == nil, canSleepWakeNow {
+            lastSleepWake = Date()
+            api.sleepWakeDisplays()
+        }
+    }
+
+    /// 睡眠-唤醒动静不小，给它一个冷却期，
+    /// 免得每秒一次的看护把机器反复弄睡再唤醒。
+    private static var lastSleepWakeStorage = Date.distantPast
+    private var lastSleepWake: Date {
+        get { Self.lastSleepWakeStorage }
+        set { Self.lastSleepWakeStorage = newValue }
+    }
+    private var canSleepWakeNow: Bool {
+        Date().timeIntervalSince(lastSleepWake) > 30
     }
 
     /// 批量恢复要用的 ID 集合。

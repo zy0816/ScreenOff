@@ -197,13 +197,10 @@ macOS has no "make this the main display" call. The trick is to move the target 
 to `(0,0)` and translate every other display by the same offset (`CGConfigureDisplayOrigin`,
 a public API), leaving the relative arrangement intact.
 
-## Known issue: some Macs cannot auto-recover after an unplug
+## Last resort: sleep, then wake
 
-**The failure reports so far are concentrated on M3 machines.**
-
-On those, unplugging the external display while the built-in one is off leaves the screen
-black, and no software approach brings it back. In that state the display IDs are simply
-invalid, and all of the following were measured to fail:
+On some machines (the reports cluster on M3), once that state is reached **nothing addressed
+to a display ID brings the screen back**. Measured to fail:
 
 - Enabling the built-in display ID alone (session or permanent) — the commit returns
   `kCGErrorIllegalArgument` even when the transaction touches nothing else
@@ -212,16 +209,31 @@ invalid, and all of the following were measured to fail:
 - Disabling the virtual display (the transaction succeeds; the system immediately makes another)
 - `CGRestorePermanentDisplayConfiguration`
 
-**If you hit the black screen: close the lid and open it again.** That is a hardware-level
-display re-enumeration and is the only method confirmed to work. Plugging the external
-display back in also works.
+The diagnostic log shows the app beginning recovery **3 milliseconds** after the unplug
+callback — and the built-in display's slot has *already* vanished from the enumeration by
+then. So this is not slow reaction or bad timing: **no handle to that display exists any
+more**, which makes the choice of API and the moment of the call equally irrelevant.
 
-The likely explanation is that the display coprocessor on these machines releases the
-built-in framebuffer once every physical display is gone, leaving nothing for software to
-re-acquire — so only a real hardware event re-initialises it. **This remains unconfirmed.**
+Yet on those same machines, **closing the lid and opening it restores the display**. What
+works is a hardware-level re-initialisation, not any ID-addressed command. Hence this, which
+performs the same power transition in software:
 
-If this affects you, enable **Diagnostic log** in the menu, reproduce, and attach
-`~/Library/Logs/DisplayToggle.log` to an issue — it records the chip and model.
+```
+pmset displaysleepnow      # put the displays to sleep
+(wait 3 seconds)
+caffeinate -u -t 2         # declare user activity to wake them
+```
+
+**Verified on an M3 that nothing else could recover** — the built-in display came back on its
+own about six seconds later. It never touches a display ID; it drives the power state, which
+is the same mechanism the lid uses.
+
+The app runs this as the last stage of recovery, and only when the built-in display has
+actually vanished from the enumeration — with the lid closed it is still there, merely
+`asleep`, and waking the machine then would be actively unhelpful. A 30 second cooldown keeps
+the once-per-second watchdog from putting the machine to sleep over and over.
+
+If even that fails: **close the lid and open it again**, or plug the external display back in.
 
 ## Known caveat
 
