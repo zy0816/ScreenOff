@@ -70,6 +70,18 @@ if let maxID = remembered.rememberedIDs.max() {
           + (maxID >= 40 ? "   ← 超出旧版 0..<40 的猜测范围" : ""))
 }
 
+// 这条防两个回归：
+//  · 1.2 曾把 detectDisplays + 4 秒等待放在恢复链最前面，而恢复窗口只有一瞬，
+//    任何前置阻塞都等于放弃。第一个 enable 必须立刻发出去。
+//  · 1.5 在链尾加了睡眠→唤醒（约 6 秒）。内建屏还在枚举里时绝不能走到那一步，
+//    所以这个 1.5 秒的上限同时守住了「正常机器不受新逻辑影响」。
+print("== 紧急恢复的延迟")
+let t0 = Date()
+DisplayController().emergencyRestoreBuiltin()
+let elapsed = Date().timeIntervalSince(t0)
+check("紧急恢复没有前置阻塞（实测 \(String(format: "%.2f", elapsed))s，需 < 1.5s）",
+      elapsed < 1.5)
+
 if dryRun {
     print("\n--dry：跳过真实开关。")
     exit(failures == 0 ? 0 : 1)
@@ -115,15 +127,6 @@ do {
 } catch {
     check("打开内建屏未抛错（\(error.localizedDescription)）", false)
 }
-
-// 这条防的是 1.2 的回归：当时把 detectDisplays + 4 秒等待放在了恢复链最前面，
-// 而恢复窗口只有一瞬，任何前置阻塞都等于放弃。第一个 enable 必须立刻发出去。
-print("== 紧急恢复的延迟")
-let t0 = Date()
-DisplayController().emergencyRestoreBuiltin()
-let elapsed = Date().timeIntervalSince(t0)
-check("紧急恢复没有前置阻塞（实测 \(String(format: "%.2f", elapsed))s，需 < 1.5s）",
-      elapsed < 1.5)
 
 print("== 主显示器切换")
 let ctl = DisplayController()
