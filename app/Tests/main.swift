@@ -86,17 +86,30 @@ check("对不存在的 ID，waitForActive(want:true) 必须为假",
 check("不存在的 ID 不会混进枚举",
       !DisplayController().displays.contains { $0.id == bogus })
 
+// Dry runs must never call emergencyRestoreBuiltin: the recovery helper
+// can submit CGS display transactions even when the built-in panel is lit.
+if dryRun {
+    print("== 关机保护（不改变真实显示器配置）")
+    DisplayLifecycle.stop()
+    check("关机标志已设置", DisplayLifecycle.isStopping)
+    check("关机后拒绝新的切屏请求",
+          (try? c.setBuiltin(false, permanent: false)) == false)
+    check("关机后状态等待立即停止",
+          !DisplayAPI.waitForActive(bogus, true, timeout: 1.0))
+    // These must all return without touching WindowServer or power state.
+    DisplayController().emergencyRestoreBuiltin()
+    DisplayAPI.shared.forceEnable([builtin.id])
+    DisplayAPI.shared.sleepWakeDisplays()
+    print("\n--dry：未提交任何显示配置，也未调用 pmset/caffeinate。")
+    exit(failures == 0 ? 0 : 1)
+}
+
 print("== 紧急恢复的延迟")
 let t0 = Date()
 DisplayController().emergencyRestoreBuiltin()
 let elapsed = Date().timeIntervalSince(t0)
 check("紧急恢复没有前置阻塞（实测 \(String(format: "%.2f", elapsed))s，需 < 1.5s）",
       elapsed < 1.5)
-
-if dryRun {
-    print("\n--dry：跳过真实开关。")
-    exit(failures == 0 ? 0 : 1)
-}
 
 guard c.canTurnOff else {
     print("\n没有点亮的外置屏，跳过开关测试（关掉就黑屏了）。")

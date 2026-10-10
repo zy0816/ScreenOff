@@ -5,7 +5,7 @@
 import AppKit
 import ServiceManagement
 
-let appVersion = "1.8"
+let appVersion = "1.8.1"
 
 // MARK: - 偏好设置
 
@@ -121,6 +121,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 只在 watchQueue 上读写。
     private var knownExternals = Set<CGDirectDisplayID>()
 
+    // System shutdown/restart bypasses the Quit menu. Never run private
+    // display configuration or artificial wake calls while powering off.
+    private var monitoringStopped = false
+
+    private func stopMonitoring() {
+        DisplayLifecycle.stop()
+        guard !monitoringStopped else { return }
+        monitoringStopped = true
+        watchTimer?.cancel()
+        watchTimer = nil
+        if let token = activityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            activityToken = nil
+        }
+        CGDisplayRemoveReconfigurationCallback(
+            reconfigurationCallback, Unmanaged.passUnretained(self).toOpaque()
+        )
+        NotificationCenter.default.removeObserver(
+            self, name: NSApplication.didChangeScreenParametersNotification, object: nil
+        )
+        NSWorkspace.shared.notificationCenter.removeObserver(
+            self, name: NSWorkspace.willPowerOffNotification, object: nil
+        )
+    }
+
+    @objc private func systemWillPowerOff(_ notification: Notification) {
+        stopMonitoring()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        stopMonitoring()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard DisplayAPI.shared.isAvailable else {
             let alert = NSAlert()
@@ -146,6 +179,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         CGDisplayRegisterReconfigurationCallback(
             reconfigurationCallback, Unmanaged.passUnretained(self).toOpaque()
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(systemWillPowerOff(_:)),
+            name: NSWorkspace.willPowerOffNotification, object: nil
         )
 
         // 挡住 App Nap：屏幕全部消失后，系统很可能把这个后台 App 节流甚至挂起，
@@ -210,6 +247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: 点击
 
     @objc private func statusItemClicked() {
+        guard !DisplayLifecycle.isStopping else { return }
         // 只认真实的右键抬起事件。合成事件（脚本、辅助功能）拿不到可靠的
         // currentEvent，一律走菜单——展开菜单是无害的，误切换屏幕不是。
         if NSApp.currentEvent?.type == .rightMouseUp {
@@ -337,6 +375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: 动作
 
     @objc private func toggleBuiltin() {
+        guard !DisplayLifecycle.isStopping else { return }
         // 掉进无物理屏状态时内建屏已经不在枚举里了，setBuiltin 会直接空转，
         // 用户点了没反应。这种情况直接走应急恢复。
         if controller.isStranded {
@@ -379,6 +418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func performToggle(turnOn on: Bool) {
+        guard !DisplayLifecycle.isStopping else { return }
         do {
             try controller.setBuiltin(on, permanent: Prefs.permanent)
             Diag.snapshot("切换后", controller)
@@ -404,6 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func makeExternalMain() {
+        guard !DisplayLifecycle.isStopping else { return }
         guard let ext = controller.externalsLit.first else { return }
         do {
             try controller.makeMain(ext)
@@ -485,11 +526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if !controller.isBuiltinOn && !controller.hasExternal {
             _ = try? controller.setBuiltin(true, permanent: Prefs.permanent)
         }
-        watchTimer?.cancel()
-        if let activityToken { ProcessInfo.processInfo.endActivity(activityToken) }
-        CGDisplayRemoveReconfigurationCallback(
-            reconfigurationCallback, Unmanaged.passUnretained(self).toOpaque()
-        )
+        stopMonitoring()
         NSApp.terminate(nil)
     }
 
@@ -500,13 +537,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func displayTopologyChanged() {
+        guard !DisplayLifecycle.isStopping else { return }
         Diag.snapshot("拓扑变化", controller)
         DispatchQueue.main.async { [weak self] in self?.updateStatusIcon() }
         // 恢复走后台队列，主线程此刻可能正被系统节流。
         watchQueue.async { [weak self] in
+            guard !DisplayLifecycle.isStopping else { return }
             self?.restoreIfStranded()
             // 拔线瞬间状态还在抖，稍后再确认一次。
             Thread.sleep(forTimeInterval: 0.8)
+            guard !DisplayLifecycle.isStopping else { return }
             self?.restoreIfStranded()
             self?.autoDisableIfNewExternal()
             DispatchQueue.main.async { [weak self] in self?.updateStatusIcon() }
@@ -522,6 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 这正是拔线后来不及恢复的头号嫌疑，所以要留下证据。
     private var lastBeat = Date()
     private func heartbeat() {
+        guard !DisplayLifecycle.isStopping else { return }
         let now = Date()
         let gap = now.timeIntervalSince(lastBeat)
         lastBeat = now
@@ -537,6 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 只在「这块外接屏是新出现的」这一瞬间做一次，绝不做持续检查——
     /// 否则用户手动把内建屏打开，下一秒就被关回去，这个功能就成了骚扰。
     private func autoDisableIfNewExternal() {
+        guard !DisplayLifecycle.isStopping else { return }
         let current = Set(controller.externalsLit.map(\.id))
         let added = current.subtracting(knownExternals)
         knownExternals = current
@@ -546,6 +588,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // 刚插上的时候拓扑还在抖（分辨率、主屏都可能再变），等稳一稳再动手
         Thread.sleep(forTimeInterval: 2.0)
+        guard !DisplayLifecycle.isStopping else { return }
         guard controller.isBuiltinOn, controller.canTurnOff else { return }
 
         Diag.log("新接入外接屏 \(added.map(String.init).joined(separator: ","))，自动关闭内建屏")
@@ -557,6 +600,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 可以在任意队列调用——只有刷新图标会回到主线程。
     private func restoreIfStranded() {
+        guard !DisplayLifecycle.isStopping else { return }
         guard Prefs.autoRestore else { return }
         guard controller.isStranded else {
             // 一切正常时顺手刷新记住的 ID，好在出事时还有得用

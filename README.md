@@ -45,6 +45,13 @@ Quit                          ⌘Q
 | Keep across restarts | Commit with `kCGConfigurePermanently` instead of session-only |
 | Launch at login | Registers a login item via `SMAppService` |
 
+## v1.8.1 — Shutdown cleanup
+
+- Stop display-watchdog work, detach display callbacks, and end the activity token when the system shuts down or the app terminates.
+- Prevent new private display configuration requests during shutdown.
+- Prevent a pending unplug recovery from waking displays while macOS is powering off.
+- Preserve the existing restart persistence setting. This is a preventive fix; there is no proof this app caused the kernel panic.
+
 ## Install
 
 Grab the `.dmg` from [Releases](../../releases) and drag the app to Applications.

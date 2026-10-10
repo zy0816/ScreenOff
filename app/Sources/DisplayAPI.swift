@@ -8,6 +8,25 @@
 
 import AppKit
 
+// Shared, lock-protected lifecycle state for AppKit and the watchdog thread.
+// Stop sending display configurations and artificial wake events after shutdown begins.
+enum DisplayLifecycle {
+    private static let lock = NSLock()
+    private static var stopped = false
+
+    static var isStopping: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped
+    }
+
+    static func stop() {
+        lock.lock()
+        stopped = true
+        lock.unlock()
+    }
+}
+
 // MARK: - 私有 API
 
 private typealias GetDisplayListFn = @convention(c) (
@@ -25,12 +44,15 @@ private let kConfigurePermanently: UInt32 = 2
 
 enum DisplayAPIError: LocalizedError {
     case symbolsMissing
+    case stopping
     case callFailed(String, CGError)
 
     var errorDescription: String? {
         switch self {
         case .symbolsMissing:
             return "这个 macOS 版本上找不到需要的私有显示配置接口。"
+        case .stopping:
+            return "系统正在关闭，已取消显示器操作。"
         case let .callFailed(name, code):
             return "\(name) 失败（CGError \(code.rawValue)）。"
         }
@@ -85,6 +107,7 @@ final class DisplayAPI {
 
     func setEnabled(_ enabled: Bool, for id: CGDirectDisplayID, permanent: Bool,
                     verifyTimeout: TimeInterval = 6.0) throws {
+        guard !DisplayLifecycle.isStopping else { throw DisplayAPIError.stopping }
         guard let beginConfig, let configureEnabled, let completeConfig else {
             throw DisplayAPIError.symbolsMissing
         }
@@ -92,12 +115,20 @@ final class DisplayAPI {
         var rc = beginConfig(&config)
         guard rc == .success else { throw DisplayAPIError.callFailed("CGSBeginDisplayConfiguration", rc) }
 
+        if DisplayLifecycle.isStopping {
+            _ = cancelConfig?(config)
+            throw DisplayAPIError.stopping
+        }
         rc = configureEnabled(config, id, enabled)
         guard rc == .success else {
             _ = cancelConfig?(config)
             throw DisplayAPIError.callFailed("CGSConfigureDisplayEnabled", rc)
         }
 
+        if DisplayLifecycle.isStopping {
+            _ = cancelConfig?(config)
+            throw DisplayAPIError.stopping
+        }
         rc = completeConfig(config, permanent ? kConfigurePermanently : kConfigureForSession)
         // 提交的返回码不可信：显示器拓扑异常时它经常返回 kCGErrorIllegalArgument(1001)，
         // 而屏幕其实已经亮了。所以以真实状态为准，只有状态确实没变才当失败。
@@ -122,10 +153,11 @@ final class DisplayAPI {
         }
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
+            if DisplayLifecycle.isStopping { return false }
             if settled() { return true }
             usleep(150_000)
         }
-        return settled()
+        return !DisplayLifecycle.isStopping && settled()
     }
 
     /// 让 WindowServer 重新探测显示器硬件，相当于旧版系统设置里的「检测显示器」。
@@ -135,7 +167,7 @@ final class DisplayAPI {
     /// 光靠 enable 谁都没用，得先让系统重新发现硬件。
     @discardableResult
     func detectDisplays() -> Bool {
-        guard let detect else { return false }
+        guard !DisplayLifecycle.isStopping, let detect else { return false }
         return detect() == .success
     }
 
@@ -148,6 +180,7 @@ final class DisplayAPI {
     ///
     /// 在一台此前怎么都恢复不了的 M3 上验证通过。整个过程约 6 秒。
     func sleepWakeDisplays() {
+        guard !DisplayLifecycle.isStopping else { return }
         func run(_ path: String, _ args: [String]) {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: path)
@@ -158,8 +191,12 @@ final class DisplayAPI {
             proc.waitUntilExit()
         }
         run("/usr/bin/pmset", ["displaysleepnow"])
-        Thread.sleep(forTimeInterval: 3.0)
-        // 声明一次用户活动，把刚睡下去的显示器唤醒
+        // Check for shutdown throughout the delay, not only at the beginning.
+        for _ in 0..<30 {
+            if DisplayLifecycle.isStopping { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        guard !DisplayLifecycle.isStopping else { return }
         run("/usr/bin/caffeinate", ["-u", "-t", "2"])
     }
 
@@ -181,12 +218,21 @@ final class DisplayAPI {
     /// 返回码不可靠（常见 kCGErrorIllegalArgument 但屏幕实际亮了），
     /// 所以这里不看返回值，由调用方轮询真实状态判断成败。
     func forceEnable(_ ids: [CGDirectDisplayID]) {
+        guard !DisplayLifecycle.isStopping else { return }
         guard let beginConfig, let configureEnabled, let completeConfig else { return }
         guard !ids.isEmpty else { return }
         var config: OpaquePointer?
         guard beginConfig(&config) == .success else { return }
         for id in ids {
+            if DisplayLifecycle.isStopping {
+                _ = cancelConfig?(config)
+                return
+            }
             _ = configureEnabled(config, id, true)
+        }
+        if DisplayLifecycle.isStopping {
+            _ = cancelConfig?(config)
+            return
         }
         _ = completeConfig(config, kConfigureForSession)
     }
@@ -310,6 +356,7 @@ final class DisplayController {
 
     @discardableResult
     func setBuiltin(_ on: Bool, permanent: Bool) throws -> Bool {
+        guard !DisplayLifecycle.isStopping else { return false }
         guard let builtin else { return false }
         guard builtin.isActive != on else { return false }
         let id = builtin.id
@@ -318,6 +365,7 @@ final class DisplayController {
         try? api.setEnabled(on, for: id, permanent: permanent, verifyTimeout: 3.0)
         if DisplayAPI.waitForActive(id, on, timeout: 0.5) { return true }
 
+        if DisplayLifecycle.isStopping { return false }
         // 关不掉就是真关不掉，没有别的办法。
         guard on else {
             throw DisplayAPIError.callFailed("CGSConfigureDisplayEnabled", .failure)
@@ -327,13 +375,16 @@ final class DisplayController {
         // 让系统恢复永久配置往往就把它点回来了，而且不会闪屏。
         // （这招在「拔线后 ID 全失效」时没用过——那时它救不了；
         //   但眼下 ID 还在，情况不一样。）
+        if DisplayLifecycle.isStopping { return false }
         CGRestorePermanentDisplayConfiguration()
         if DisplayAPI.waitForActive(id, true, timeout: 2.5) { return true }
 
         // 点不亮的情况有救：有些机器光提交配置不算数，显示拓扑得真正重建一次才认。
         // 睡眠→唤醒正是干这个的——拔线恢复用的也是同一招。
         // 代价是所有屏幕会闪一下，约 6 秒，但总好过打不开。
+        if DisplayLifecycle.isStopping { return false }
         api.sleepWakeDisplays()
+        if DisplayLifecycle.isStopping { return false }
         if DisplayAPI.waitForActive(id, true, timeout: 4.0) { return true }
 
         // 唤醒之后再提交一次：拓扑刚重建，这时候 ID 通常又认了。
@@ -349,6 +400,7 @@ final class DisplayController {
     /// 其余屏按相同位移平移，这样相对排列不变，只是换了谁在原点。
     /// 这里用的都是公开 API。
     func makeMain(_ target: DisplayInfo) throws {
+        guard !DisplayLifecycle.isStopping else { throw DisplayAPIError.stopping }
         var config: CGDisplayConfigRef?
         var rc = CGBeginDisplayConfiguration(&config)
         guard rc == .success else { throw DisplayAPIError.callFailed("CGBeginDisplayConfiguration", rc) }
@@ -366,6 +418,10 @@ final class DisplayController {
             }
         }
 
+        if DisplayLifecycle.isStopping {
+            CGCancelDisplayConfiguration(config)
+            throw DisplayAPIError.stopping
+        }
         rc = CGCompleteDisplayConfiguration(config, .permanently)
         guard rc == .success else { throw DisplayAPIError.callFailed("CGCompleteDisplayConfiguration", rc) }
     }
@@ -377,6 +433,7 @@ final class DisplayController {
     ///   2. 用记住的 ID 单独点亮
     ///   3. 批量点亮所有 ID（实测唯一在无物理屏状态下有效的办法）
     func emergencyRestoreBuiltin() {
+        guard !DisplayLifecycle.isStopping else { return }
         // 合盖不是故障：内建屏还在枚举里，只是 asleep。这时候去唤醒机器是帮倒忙。
         if let builtin, builtin.isAsleep { return }
 
@@ -409,6 +466,7 @@ final class DisplayController {
 
         // 最后一招：用睡眠→唤醒绕开已经失效的 ID。
         // 这是唯一验证过能从那个状态里出来的办法。
+        guard !DisplayLifecycle.isStopping else { return }
         if canSleepWakeNow {
             lastSleepWake = Date()
             api.sleepWakeDisplays()
